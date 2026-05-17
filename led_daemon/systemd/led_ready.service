@@ -1,0 +1,13 @@
+[Unit]
+Description=Signal LED daemon that system boot is complete
+# Change After= to a more specific target if needed, e.g.:
+#   After=ros2_bringup.service
+After=multi-user.target
+Requires=led_daemon.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl kill --signal=SIGUSR1 led_daemon.service
+
+[Install]
+WantedBy=multi-user.target

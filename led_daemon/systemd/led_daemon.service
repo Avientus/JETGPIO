@@ -1,0 +1,12 @@
+[Unit]
+Description=LED strip boot indicator and SPI controller daemon
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/led_daemon
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

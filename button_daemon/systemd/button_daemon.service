@@ -1,0 +1,16 @@
+[Unit]
+Description=GPIO reboot and power-off button daemon
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/button_daemon
+Restart=on-failure
+RestartSec=2
+# stdout/stderr go to the systemd journal — view with:
+#   journalctl -u button_daemon -f
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
