@@ -10,12 +10,12 @@
  * Active-low: pin reads 0 when pressed, 1 when released.
  *
  * Any unused input pin on the 40-pin header works.
- * Default assignments (available on both Nano and Orin):
- *   Pin 29 — reboot
- *   Pin 31 — power off
+ * Default assignments:
+ *   Pin 15 — reboot   (avoid 29/31: CAN bus on Orin AGX)
+ *   Pin 13 — power off (avoid 29/31: CAN bus on Orin AGX)
  */
-#define REBOOT_PIN       29
-#define POWER_PIN        31
+#define REBOOT_PIN       15
+#define POWER_PIN        13
 
 /* ── Timing (milliseconds) ──────────────────────────────────────────────── */
 #define DEBOUNCE_MS      50      /* ignore bounces shorter than this */

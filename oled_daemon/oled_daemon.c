@@ -21,8 +21,9 @@
 #define I2C_DEV      "/dev/i2c-7"
 #define I2C_ADDR      0x3C   /* 0x3D if ADDR pin is high */
 
-/* GPIO pin for display cycle button (active-low, pull-up to 3.3 V) */
-#define CYCLE_PIN        37
+/* GPIO pin for display cycle button (active-low, pull-up to 3.3 V)
+ * Avoid pins 29/31/37: CAN bus on Orin AGX */
+#define CYCLE_PIN        18
 
 /* File other programs can write to update the custom text screen */
 #define CUSTOM_TEXT_FILE  "/run/oled_text"
