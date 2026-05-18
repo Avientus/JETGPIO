@@ -15,10 +15,10 @@
 /* ── Configuration ──────────────────────────────────────────────────────── */
 
 /* I2C device for OLED.
- * On Jetson Orin:  pins 27(SDA)/28(SCL)  →  /dev/i2c-1
- *                  pins 3(SDA)/5(SCL)    →  /dev/i2c-7
+ * On Jetson Orin:  pins 3(SDA)/5(SCL)   →  /dev/i2c-7  (use this — i2c-1 shares bus with system devices)
+ *                  pins 27(SDA)/28(SCL)  →  /dev/i2c-1  (avoid — disrupts network on Orin)
  * On Jetson Nano:  pins 27/28            →  /dev/i2c-1 */
-#define I2C_DEV      "/dev/i2c-1"
+#define I2C_DEV      "/dev/i2c-7"
 #define I2C_ADDR      0x3C   /* 0x3D if ADDR pin is high */
 
 /* GPIO pin for display cycle button (active-low, pull-up to 3.3 V) */
