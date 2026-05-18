@@ -1,38 +1,43 @@
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <signal.h>
-
-#include <jetgpio.h>
+#include <pthread.h>
+#include <time.h>
+#include <gpiod.h>
 
 /* ── Pin configuration ──────────────────────────────────────────────────── *
  * Circuit: button between pin and GND, with a 10kΩ pull-up to 3.3V.
  * Active-low: pin reads 0 when pressed, 1 when released.
  *
- * Any unused input pin on the 40-pin header works.
- * Default assignments:
- *   Pin 15 — reboot   (avoid 29/31: CAN bus on Orin AGX)
- *   Pin 13 — power off (avoid 29/31: CAN bus on Orin AGX)
+ * Find GPIO line offsets by running on the Jetson:
+ *   gpioinfo tegra-gpio
+ *
+ * On Orin AGX:
+ *   Pin 13 = G3_SOC_GPIO37  →  verify offset with gpioinfo
+ *   Pin 15 = EDP_SOC_GPIO39 →  verify offset with gpioinfo
+ *
+ * Avoid pins 29/31/37: CAN bus on Orin AGX.
  */
-#define REBOOT_PIN       15
-#define POWER_PIN        13
+#define GPIO_CHIP_LABEL     "tegra-gpio"
+
+#define REBOOT_LINE_OFFSET   88   /* pin 15: verify with: gpioinfo tegra-gpio | grep EDP_SOC_GPIO39 */
+#define POWER_LINE_OFFSET    80   /* pin 13: verify with: gpioinfo tegra-gpio | grep G3_SOC_GPIO37  */
+
+/* Set to 1 to enable the internal pull-up resistor on the button pins.
+ * Requires kernel ≥ 5.5 and a GPIO driver that supports bias config.
+ * If the daemon fails to start with this enabled, use external pull-ups
+ * and set this to 0. */
+#define USE_INTERNAL_PULLUP  1
 
 /* ── Timing (milliseconds) ──────────────────────────────────────────────── */
 #define DEBOUNCE_MS      50      /* ignore bounces shorter than this */
-#define REBOOT_HOLD_MS  1000     /* hold reboot button for 1s  */
-#define POWER_HOLD_MS   3000     /* hold power button for 3s   */
-#define POLL_MS           10     /* main loop poll interval    */
+#define REBOOT_HOLD_MS  1000     /* hold reboot button for 1 s  */
+#define POWER_HOLD_MS   3000     /* hold power button for 3 s   */
+#define POLL_MS           10     /* hold-check poll interval    */
 
-/* ── ISR flags (set by jetgpio ISR thread, read by main loop) ───────────── */
-static volatile int reboot_pressed = 0;
-static volatile int power_pressed  = 0;
-
-static unsigned long reboot_ts;
-static unsigned long power_ts;
-
-static void reboot_isr(void) { reboot_pressed = 1; }
-static void power_isr(void)  { power_pressed  = 1; }
-
+/* ── Shared state ───────────────────────────────────────────────────────── */
 static volatile sig_atomic_t running = 1;
 
 static void signal_handler(int sig)
@@ -41,27 +46,81 @@ static void signal_handler(int sig)
     running = 0;
 }
 
-/* ── Hold-detection helper ──────────────────────────────────────────────── *
- * Returns 1 if 'pin' stays low for at least 'required_ms', 0 otherwise.
- * Polls at POLL_MS intervals so the loop stays responsive.
+/* ── Hold-detection ─────────────────────────────────────────────────────── *
+ * After a falling edge is detected, poll the line level every POLL_MS.
+ * Returns 1 if the pin stays low for at least required_ms, 0 if released.
  */
-static int held_for(int pin, int required_ms)
+static int held_for(struct gpiod_line *line, int required_ms)
 {
     int elapsed = 0;
-    while (gpioRead(pin) == 0 && running) {
-        usleep(POLL_MS * 1000);
-        elapsed += POLL_MS;
+    while (running) {
+        int val = gpiod_line_get_value(line);
+        if (val != 0)        /* released */
+            return 0;
         if (elapsed >= required_ms)
             return 1;
+        struct timespec ts = {0, POLL_MS * 1000000L};
+        nanosleep(&ts, NULL);
+        elapsed += POLL_MS;
     }
     return 0;
 }
 
-/* Wait until pin returns high (button released) */
-static void wait_release(int pin)
+static void wait_release(struct gpiod_line *line)
 {
-    while (gpioRead(pin) == 0 && running)
-        usleep(POLL_MS * 1000);
+    while (running && gpiod_line_get_value(line) == 0) {
+        struct timespec ts = {0, POLL_MS * 1000000L};
+        nanosleep(&ts, NULL);
+    }
+}
+
+/* ── Button thread ──────────────────────────────────────────────────────── */
+typedef struct {
+    struct gpiod_line *line;
+    int                hold_ms;
+    const char        *name;
+    const char        *systemctl_cmd;  /* "reboot" or "poweroff" */
+} BtnCtx;
+
+static void *button_thread(void *arg)
+{
+    BtnCtx *ctx = arg;
+    struct gpiod_line_event ev;
+    struct timespec timeout = {0, 100 * 1000000L};  /* 100 ms */
+
+    while (running) {
+        int r = gpiod_line_event_wait(ctx->line, &timeout);
+        if (r != 1)
+            continue;
+        if (gpiod_line_event_read(ctx->line, &ev) != 0)
+            continue;
+        if (ev.event_type != GPIOD_LINE_EVENT_FALLING_EDGE)
+            continue;
+
+        /* Debounce: wait, then confirm pin is still low */
+        struct timespec deb = {0, DEBOUNCE_MS * 1000000L};
+        nanosleep(&deb, NULL);
+        if (gpiod_line_get_value(ctx->line) != 0)
+            continue;   /* bounce, not a real press */
+
+        printf("%s button pressed, checking hold (%d ms required)...\n",
+               ctx->name, ctx->hold_ms);
+        fflush(stdout);
+
+        if (held_for(ctx->line, ctx->hold_ms)) {
+            printf("%s button held — triggering %s\n",
+                   ctx->name, ctx->systemctl_cmd);
+            fflush(stdout);
+            wait_release(ctx->line);
+            char cmd[64];
+            snprintf(cmd, sizeof(cmd), "systemctl %s", ctx->systemctl_cmd);
+            system(cmd);
+        } else {
+            printf("%s button released early — ignoring\n", ctx->name);
+            fflush(stdout);
+        }
+    }
+    return NULL;
 }
 
 /* ── Main ───────────────────────────────────────────────────────────────── */
@@ -74,53 +133,63 @@ int main(void)
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT,  &sa, NULL);
 
-    int ret = gpioInitialise();
-    if (ret < 0) {
-        fprintf(stderr, "gpioInitialise failed: %d\n", ret);
+    struct gpiod_chip *chip = gpiod_chip_open_by_label(GPIO_CHIP_LABEL);
+    if (!chip) {
+        fprintf(stderr, "Cannot open GPIO chip \"%s\"\n", GPIO_CHIP_LABEL);
         return 1;
     }
 
-    gpioSetMode(REBOOT_PIN, JET_INPUT);
-    gpioSetMode(POWER_PIN,  JET_INPUT);
+    struct gpiod_line *reboot_line = gpiod_chip_get_line(chip, REBOOT_LINE_OFFSET);
+    struct gpiod_line *power_line  = gpiod_chip_get_line(chip, POWER_LINE_OFFSET);
 
-    /* Use falling-edge ISR with debounce to catch initial press.
-     * Long-press timing is handled by held_for() in the main loop. */
-    gpioSetISRFunc(REBOOT_PIN, FALLING_EDGE, DEBOUNCE_MS * 1000, &reboot_ts, reboot_isr);
-    gpioSetISRFunc(POWER_PIN,  FALLING_EDGE, DEBOUNCE_MS * 1000, &power_ts,  power_isr);
-
-    printf("Button daemon running — reboot pin %d, power pin %d\n",
-           REBOOT_PIN, POWER_PIN);
-
-    while (running) {
-        if (reboot_pressed) {
-            reboot_pressed = 0;
-            printf("Reboot button: checking hold (%d ms required)...\n", REBOOT_HOLD_MS);
-            if (held_for(REBOOT_PIN, REBOOT_HOLD_MS)) {
-                printf("Reboot button held — rebooting\n");
-                fflush(stdout);
-                wait_release(REBOOT_PIN);
-                system("systemctl reboot");
-            } else {
-                printf("Reboot button released early — ignoring\n");
-            }
-        }
-
-        if (power_pressed) {
-            power_pressed = 0;
-            printf("Power button: checking hold (%d ms required)...\n", POWER_HOLD_MS);
-            if (held_for(POWER_PIN, POWER_HOLD_MS)) {
-                printf("Power button held — powering off\n");
-                fflush(stdout);
-                wait_release(POWER_PIN);
-                system("systemctl poweroff");
-            } else {
-                printf("Power button released early — ignoring\n");
-            }
-        }
-
-        usleep(POLL_MS * 1000);
+    if (!reboot_line || !power_line) {
+        fprintf(stderr, "Cannot get GPIO lines (reboot=%d, power=%d) — "
+                "check offsets with: gpioinfo %s\n",
+                REBOOT_LINE_OFFSET, POWER_LINE_OFFSET, GPIO_CHIP_LABEL);
+        gpiod_chip_close(chip);
+        return 1;
     }
 
-    gpioTerminate();
+    struct gpiod_line_request_config btn_cfg = {
+        .consumer     = "button_daemon",
+        .request_type = GPIOD_LINE_REQUEST_EVENT_FALLING_EDGE,
+        .flags        = USE_INTERNAL_PULLUP ? GPIOD_LINE_REQUEST_FLAG_BIAS_PULL_UP : 0,
+    };
+
+    if (gpiod_line_request(reboot_line, &btn_cfg, 0) < 0 ||
+        gpiod_line_request(power_line,  &btn_cfg, 0) < 0) {
+        fprintf(stderr, "Cannot request GPIO edge events — "
+                "another process may own the lines\n");
+        gpiod_chip_close(chip);
+        return 1;
+    }
+
+    BtnCtx reboot_ctx = {
+        .line          = reboot_line,
+        .hold_ms       = REBOOT_HOLD_MS,
+        .name          = "Reboot",
+        .systemctl_cmd = "reboot",
+    };
+    BtnCtx power_ctx = {
+        .line          = power_line,
+        .hold_ms       = POWER_HOLD_MS,
+        .name          = "Power",
+        .systemctl_cmd = "poweroff",
+    };
+
+    pthread_t reboot_thread, power_thread_id;
+    pthread_create(&reboot_thread,    NULL, button_thread, &reboot_ctx);
+    pthread_create(&power_thread_id,  NULL, button_thread, &power_ctx);
+
+    printf("Button daemon running — reboot line %d, power line %d\n",
+           REBOOT_LINE_OFFSET, POWER_LINE_OFFSET);
+    fflush(stdout);
+
+    pthread_join(reboot_thread,   NULL);
+    pthread_join(power_thread_id, NULL);
+
+    gpiod_line_release(reboot_line);
+    gpiod_line_release(power_line);
+    gpiod_chip_close(chip);
     return 0;
 }

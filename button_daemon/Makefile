@@ -1,6 +1,6 @@
 CC      = gcc
 CFLAGS  = -Wall -Wextra -O2
-LDFLAGS = -ljetgpio
+LDFLAGS = -lgpiod -lpthread
 
 TARGET = button_daemon
 

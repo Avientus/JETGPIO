@@ -8,7 +8,12 @@ The daemon is installed as a systemd service and starts early in the boot sequen
 
 ## Hardware & Wiring
 
-Both buttons are **active-low**: the pin reads 1 at idle and 0 when the button is pressed. Each button pin requires a **10 kΩ pull-up resistor** connected from the pin to 3.3 V. jetgpio does not configure internal pull-ups, so the external resistor is mandatory.
+Both buttons are **active-low**: the pin reads 1 at idle and 0 when the button is pressed.
+
+Pull-up resistors can be provided either internally (via the GPIO driver) or externally:
+
+- **Internal pull-up (default):** `USE_INTERNAL_PULLUP 1` in `button_daemon.c`. Requires kernel ≥ 5.5 and a GPIO driver that supports bias configuration. Works on Jetson with JetPack 5 and 6.
+- **External pull-up:** Set `USE_INTERNAL_PULLUP 0` and wire a 10 kΩ resistor from each button pin to 3.3 V.
 
 ```
 3.3V ── 10kΩ ── [GPIO pin] ──┬── [button] ── GND
@@ -19,65 +24,77 @@ Both buttons are **active-low**: the pin reads 1 at idle and 0 when the button i
 
 ### Default pin assignments
 
-| Button  | Pin | Hold duration | Action             |
-|---------|-----|---------------|--------------------|
-| Reboot  | 29  | 1 second      | systemctl reboot   |
-| Power   | 31  | 3 seconds     | systemctl poweroff |
+| Button | Header pin | Hold duration | Action             |
+|--------|------------|---------------|--------------------|
+| Reboot | 15         | 1 second      | systemctl reboot   |
+| Power  | 13         | 3 seconds     | systemctl poweroff |
 
-Pins 29 and 31 are available on both the Jetson Nano and Jetson Orin 40-pin headers. Any unused input-capable pin on the 40-pin header can be used instead.
-
-## Behaviour
-
-The interrupt service routine (ISR) catches the **falling edge** (button press) with a 50 ms debounce filter. The main loop then polls the pin to confirm it remains held for the required duration. Releasing the button before the threshold is reached cancels the action — nothing happens. All events (press detected, threshold reached, action triggered) are written to the systemd journal.
-
-| Button | Default pin | Hold duration | Action              |
-|--------|-------------|---------------|---------------------|
-| Reboot | 29          | 1 second      | systemctl reboot    |
-| Power  | 31          | 3 seconds     | systemctl poweroff  |
+Avoid pins 29, 31, and 37 on the Orin AGX — these are used by the CAN bus.
 
 ## Dependencies
 
-The **jetgpio** library must be installed on the system before building:
+- `libgpiod` (replaces jetgpio for GPIO access)
 
 ```
-sudo make && sudo make install
+sudo apt install libgpiod-dev
 ```
 
-Run the above from the jetgpio repository root.
+## Finding GPIO line offsets
+
+The daemon addresses GPIO lines by their offset within the `tegra-gpio` chip, **not** by 40-pin header number. Find the correct offsets on the Jetson before building:
+
+```bash
+# List all lines with their offsets
+gpioinfo tegra-gpio
+
+# Find a specific line by signal name
+gpioinfo tegra-gpio | grep EDP_SOC_GPIO39   # pin 15 on Orin AGX
+gpioinfo tegra-gpio | grep G3_SOC_GPIO37    # pin 13 on Orin AGX
+```
+
+Update `REBOOT_LINE_OFFSET` and `POWER_LINE_OFFSET` in `button_daemon.c` to match.
+
+## Behaviour
+
+Each button runs in a dedicated thread. A **falling-edge event** (button press) wakes the thread, which then polls the line level to confirm the button stays held for the required duration. Releasing before the threshold cancels the action silently. All events are written to the systemd journal.
 
 ## Build & Install
 
-```
+```bash
 cd button_daemon
 sudo make
 sudo make install
 ```
 
-`sudo make install` copies the binary and installs the systemd unit file, then enables and starts the service.
+`sudo make install` copies the binary, installs the systemd unit file, then enables and starts the service.
 
-## Changing Pins or Hold Durations
+## Configuration
 
 Edit the `#define` block at the top of `button_daemon.c`, then rebuild and reinstall:
 
 ```c
-#define REBOOT_PIN      29
-#define POWER_PIN       31
-#define REBOOT_HOLD_MS  1000
-#define POWER_HOLD_MS   3000
+#define GPIO_CHIP_LABEL      "tegra-gpio"
+#define REBOOT_LINE_OFFSET    88      /* verify with gpioinfo */
+#define POWER_LINE_OFFSET     80      /* verify with gpioinfo */
+
+#define USE_INTERNAL_PULLUP   1       /* 0 = use external pull-up resistors */
+
+#define REBOOT_HOLD_MS       1000
+#define POWER_HOLD_MS        3000
 ```
 
 ## Logs
 
 Follow live output from the daemon:
 
-```
+```bash
 journalctl -u button_daemon -f
 ```
 
 ## Uninstall
 
-```
+```bash
 sudo make uninstall
 ```
 
-This stops and disables the service, removes the unit file, and deletes the installed binary.
+Stops and disables the service, removes the unit file, and deletes the installed binary.
