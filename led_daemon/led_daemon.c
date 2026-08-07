@@ -15,6 +15,7 @@
 #include <fcntl.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <ifaddrs.h>
 
 #include <jetgpio.h>
 
@@ -131,17 +132,18 @@ static int is_wireless(const char *iface)
     return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
-/* Returns 1 if operstate == "up" */
-static int is_if_up(const char *iface)
+/* Returns 1 if the interface has an assigned IPv4 address (true active connection) */
+static int has_ip(const char *iface)
 {
-    char path[256];
-    snprintf(path, sizeof(path), "/sys/class/net/%s/operstate", iface);
-    FILE *f = fopen(path, "r");
-    if (!f) return 0;
-    char state[32];
-    int ok = fscanf(f, "%31s", state) == 1 && strcmp(state, "up") == 0;
-    fclose(f);
-    return ok;
+    struct ifaddrs *ifap, *ifa;
+    if (getifaddrs(&ifap) < 0) return 0;
+    int found = 0;
+    for (ifa = ifap; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
+        if (strcmp(ifa->ifa_name, iface) == 0) { found = 1; break; }
+    }
+    freeifaddrs(ifap);
+    return found;
 }
 
 /* Non-blocking TCP connect to INTERNET_CHECK_IP:PORT; returns 1 on success */
@@ -187,7 +189,7 @@ static NetState check_network(void)
     struct dirent *de;
     while ((de = readdir(d)) != NULL) {
         const char *name = de->d_name;
-        if (!is_physical(name) || !is_if_up(name)) continue;
+        if (!is_physical(name) || !has_ip(name)) continue;
         if (is_wireless(name))
             has_wifi = 1;
         else
@@ -424,15 +426,18 @@ int main(void)
     while (running)
         pause();
 
-    /* Cleanup: clear all LEDs */
-    pthread_mutex_lock(&spi_mutex);
-    memset(led_state, 0, sizeof(led_state));
-    flush_leds();
-    pthread_mutex_unlock(&spi_mutex);
-
     pthread_join(sock_tid, NULL);
     pthread_join(fx_tid,   NULL);
     pthread_join(net_tid,  NULL);
+
+    /* Set LED 0 solid red: Jetson is off.
+     * WS2812B holds this colour while the strip has 5V from the drone battery. */
+    pthread_mutex_lock(&spi_mutex);
+    memset(led_state, 0, sizeof(led_state));
+    led_state[0][1] = 40;   /* GRB layout: index 1 is red */
+    flush_leds();
+    pthread_mutex_unlock(&spi_mutex);
+
     spiClose(spi_handle);
     gpioTerminate();
     return 0;
