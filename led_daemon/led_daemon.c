@@ -29,6 +29,9 @@
 #define NET_POLL_INTERVAL_S 5   /* network state poll period */
 #define INTERNET_CHECK_IP   "8.8.8.8"
 #define INTERNET_CHECK_PORT 53
+#define RUNNING_FLAG        "/var/lib/led_daemon/running"
+#define CRASH_BLINK_HALF_MS 150   /* fast blink half-period when crash detected */
+#define CRASH_SHOW_SEC      10    /* seconds to show crash indicator before green */
 
 /* ── Effect definitions ─────────────────────────────────────────────────── *
  *
@@ -388,6 +391,13 @@ int main(void)
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT,  &sa, NULL);
 
+    /* Dirty-bit crash detection: flag file is created on start, removed on clean shutdown.
+     * If it already exists at startup the previous run didn't exit cleanly. */
+    int crashed = (access(RUNNING_FLAG, F_OK) == 0);
+    mkdir("/var/lib/led_daemon", 0755);   /* no-op if already exists */
+    int flagfd = open(RUNNING_FLAG, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (flagfd >= 0) close(flagfd);
+
     int ret = gpioInitialise();
     if (ret < 0) {
         fprintf(stderr, "gpioInitialise failed: %d\n", ret);
@@ -420,8 +430,20 @@ int main(void)
         usleep(BLINK_INTERVAL_US);
     }
 
-    if (running)
-        set_system_led(40, 0, 0);   /* GRB: G=40, R=0, B=0 — solid green */
+    if (running) {
+        if (crashed) {
+            /* Fast red blink for CRASH_SHOW_SEC seconds to signal unclean previous shutdown */
+            int iters = (CRASH_SHOW_SEC * 1000) / (CRASH_BLINK_HALF_MS * 2);
+            for (int i = 0; i < iters && running; i++) {
+                set_system_led(0, 40, 0);
+                usleep(CRASH_BLINK_HALF_MS * 1000);
+                set_system_led(0, 0, 0);
+                usleep(CRASH_BLINK_HALF_MS * 1000);
+            }
+        }
+        if (running)
+            set_system_led(40, 0, 0);   /* GRB: G=40, R=0, B=0 — solid green */
+    }
 
     while (running)
         pause();
@@ -429,6 +451,8 @@ int main(void)
     pthread_join(sock_tid, NULL);
     pthread_join(fx_tid,   NULL);
     pthread_join(net_tid,  NULL);
+
+    unlink(RUNNING_FLAG);   /* clean shutdown — clear dirty bit */
 
     /* Set LED 0 solid red: Jetson is off.
      * WS2812B holds this colour while the strip has 5V from the drone battery. */
