@@ -2,10 +2,11 @@
 
 ## Overview
 
-`led_daemon` is a C daemon that owns the SPI bus and drives a 12-LED WS2812B strip. It runs as a systemd service and fulfills two roles:
+`led_daemon` is a C daemon that owns the SPI bus and drives a 12-LED WS2812B strip. It runs as a systemd service and fulfills three roles:
 
 1. **Boot indicator (LED 0):** Blinks red while the system is booting, then turns solid green once the system is ready.
-2. **User LED controller (LEDs 1–11):** Accepts color and effect commands from other processes via a Unix domain socket at `/run/leds.sock`.
+2. **Network status indicator (LED 1):** Automatically reflects the current network and internet connectivity state (see [Network Status LED](#network-status-led)).
+3. **User LED controller (LEDs 2–11):** Accepts color and effect commands from other processes via a Unix domain socket at `/run/leds.sock`.
 
 ## Hardware & Wiring
 
@@ -51,7 +52,23 @@ If you want the green indicator to mean "ROS2 ready" instead of "multi-user reac
 | Index   | Owner          | Description                                          |
 |---------|----------------|------------------------------------------------------|
 | 0       | System         | Boot indicator — commands targeting index 0 are silently ignored |
-| 1 – 11  | User           | Freely controllable via the socket protocol          |
+| 1       | System         | Network status — commands targeting index 1 are silently ignored |
+| 2 – 11  | User           | Freely controllable via the socket protocol          |
+
+## Network Status LED
+
+LED 1 is managed internally by the daemon and updated every 5 seconds. It cannot be overridden via the socket protocol.
+
+| Colour | Condition |
+|--------|-----------|
+| Off    | No WiFi or Ethernet interface is up |
+| Blue   | WiFi connected, no Ethernet, no internet access |
+| Yellow | Ethernet connected, no internet access |
+| Green  | Internet reachable (TCP connect to 8.8.8.8:53 succeeds) |
+
+Priority order (highest wins): **internet → ethernet → wifi → off**
+
+Only physical interfaces are considered — virtual interfaces such as `lo`, `docker0`, and `veth*` are excluded. The internet check is a non-blocking TCP connect with a 2-second timeout; no DNS lookup is required.
 
 ## Socket Protocol
 
@@ -75,8 +92,8 @@ Connect to `/run/leds.sock` (type `SOCK_STREAM`) and send **7-byte** command pac
 
 | Value  | Meaning                         |
 |--------|---------------------------------|
-| `0xFF` | Apply command to all user LEDs (1–11) |
-| `0xFE` | Clear all user LEDs (turn off)  |
+| `0xFF` | Apply command to all user LEDs (2–11) |
+| `0xFE` | Clear all user LEDs (turn off, 2–11) |
 
 `period_ms` is a `uint16` in big-endian byte order across bytes 5–6. Set both bytes to `0` to use the default period of **500 ms**.
 

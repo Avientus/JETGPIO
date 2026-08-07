@@ -11,6 +11,11 @@
 #include <sys/un.h>
 #include <sys/stat.h>
 #include <sys/select.h>
+#include <dirent.h>
+#include <fcntl.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <ifaddrs.h>
 
 #include <jetgpio.h>
 
@@ -20,6 +25,13 @@
 #define SOCKET_PATH      "/run/leds.sock"
 #define BLINK_INTERVAL_US  500000
 #define EFFECT_TICK_MS   20      /* effect engine update rate (~50 Hz) */
+#define NET_LED_INDEX    1       /* LED 1 reserved for network status */
+#define NET_POLL_INTERVAL_S 5   /* network state poll period */
+#define INTERNET_CHECK_IP   "8.8.8.8"
+#define INTERNET_CHECK_PORT 53
+#define RUNNING_FLAG        "/var/lib/led_daemon/running"
+#define CRASH_BLINK_HALF_MS 150   /* fast blink half-period when crash detected */
+#define CRASH_SHOW_SEC      10    /* seconds to show crash indicator before green */
 
 /* ── Effect definitions ─────────────────────────────────────────────────── *
  *
@@ -27,13 +39,20 @@
  *   [index, r, g, b, effect, period_ms_hi, period_ms_lo]
  *
  *   index  0     : system LED (boot indicator) — always rejected
- *   index  1-11  : individual user LEDs
- *   index  0xFF  : apply to all user LEDs (1-11)
- *   index  0xFE  : clear all user LEDs (solid black)
+ *   index  1     : network status LED — always rejected (managed internally)
+ *   index  2-11  : individual user LEDs
+ *   index  0xFF  : apply to all user LEDs (2-11)
+ *   index  0xFE  : clear all user LEDs (solid black, 2-11)
  *
  *   effect 0 : SOLID  — static colour
  *   effect 1 : BLINK  — on/off at period_ms
  *   effect 2 : FADE   — sine-wave brightness at period_ms
+ *
+ * LED 1 network status colours (managed by net_thread):
+ *   off    — no WiFi or Ethernet interface up
+ *   blue   — WiFi connected (no Ethernet, no internet)
+ *   yellow — Ethernet connected (no internet)
+ *   green  — internet reachable (overrides all)
  */
 #define EFFECT_SOLID  0
 #define EFFECT_BLINK  1
@@ -88,6 +107,130 @@ static void set_system_led(uint8_t g, uint8_t r, uint8_t b)
     led_state[0][2] = b;
     flush_leds();
     pthread_mutex_unlock(&spi_mutex);
+}
+
+/* forward declaration — defined in "Socket handler" section below */
+static void apply_config(int i, uint8_t r, uint8_t g, uint8_t b,
+                         uint8_t effect, uint16_t period_ms);
+
+/* ── Network status monitor ─────────────────────────────────────────────── */
+
+typedef enum { NET_NONE, NET_WIFI, NET_ETHERNET, NET_INTERNET } NetState;
+
+/* Returns 1 if the interface has a real hardware device (excludes lo, veth, docker, etc.) */
+static int is_physical(const char *iface)
+{
+    char path[256];
+    snprintf(path, sizeof(path), "/sys/class/net/%s/device", iface);
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
+/* Returns 1 if the interface is wireless (has /sys/class/net/<iface>/wireless dir) */
+static int is_wireless(const char *iface)
+{
+    char path[256];
+    snprintf(path, sizeof(path), "/sys/class/net/%s/wireless", iface);
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+/* Returns 1 if the interface has an assigned IPv4 address (true active connection) */
+static int has_ip(const char *iface)
+{
+    struct ifaddrs *ifap, *ifa;
+    if (getifaddrs(&ifap) < 0) return 0;
+    int found = 0;
+    for (ifa = ifap; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
+        if (strcmp(ifa->ifa_name, iface) == 0) { found = 1; break; }
+    }
+    freeifaddrs(ifap);
+    return found;
+}
+
+/* Non-blocking TCP connect to INTERNET_CHECK_IP:PORT; returns 1 on success */
+static int has_internet(void)
+{
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return 0;
+
+    int flags = fcntl(sock, F_GETFL, 0);
+    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons(INTERNET_CHECK_PORT);
+    inet_pton(AF_INET, INTERNET_CHECK_IP, &addr.sin_addr);
+
+    int ret = connect(sock, (struct sockaddr *)&addr, sizeof(addr));
+    if (ret == 0) { close(sock); return 1; }
+    if (errno != EINPROGRESS) { close(sock); return 0; }
+
+    fd_set wfds;
+    FD_ZERO(&wfds);
+    FD_SET(sock, &wfds);
+    struct timeval tv = {2, 0};
+    int sel = select(sock + 1, NULL, &wfds, NULL, &tv);
+    if (sel <= 0) { close(sock); return 0; }
+
+    int err = 0;
+    socklen_t errlen = sizeof(err);
+    getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &errlen);
+    close(sock);
+    return err == 0;
+}
+
+static NetState check_network(void)
+{
+    int has_eth = 0, has_wifi = 0;
+
+    DIR *d = opendir("/sys/class/net");
+    if (!d) return NET_NONE;
+
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        const char *name = de->d_name;
+        if (!is_physical(name) || !has_ip(name)) continue;
+        if (is_wireless(name))
+            has_wifi = 1;
+        else
+            has_eth = 1;
+    }
+    closedir(d);
+
+    if (!has_eth && !has_wifi) return NET_NONE;
+    if (has_internet())        return NET_INTERNET;
+    if (has_eth)               return NET_ETHERNET;
+    return NET_WIFI;
+}
+
+static void set_net_led(NetState state)
+{
+    uint8_t r, g, b;
+    switch (state) {
+        case NET_INTERNET: r =  0; g = 40; b =  0; break;  /* green  */
+        case NET_ETHERNET: r = 40; g = 40; b =  0; break;  /* yellow */
+        case NET_WIFI:     r =  0; g =  0; b = 40; break;  /* blue   */
+        default:           r =  0; g =  0; b =  0; break;  /* off    */
+    }
+    pthread_mutex_lock(&spi_mutex);
+    apply_config(NET_LED_INDEX, r, g, b, EFFECT_SOLID, 0);
+    flush_leds();
+    pthread_mutex_unlock(&spi_mutex);
+}
+
+static void *net_thread(void *arg)
+{
+    (void)arg;
+    while (running) {
+        set_net_led(check_network());
+        /* Sleep in 100 ms slices so we respond promptly to running=0 */
+        for (int i = 0; i < NET_POLL_INTERVAL_S * 10 && running; i++)
+            usleep(100000);
+    }
+    return NULL;
 }
 
 /* ── Effect engine ──────────────────────────────────────────────────────── */
@@ -162,16 +305,17 @@ static void handle_command(const uint8_t cmd[7])
     uint8_t  effect    = cmd[4];
     uint16_t period_ms = ((uint16_t)cmd[5] << 8) | cmd[6];
 
-    if (idx == 0 || (idx > (uint8_t)(NUM_LEDS - 1) && idx != 0xFF && idx != 0xFE))
+    if (idx == 0 || idx == NET_LED_INDEX ||
+        (idx > (uint8_t)(NUM_LEDS - 1) && idx != 0xFF && idx != 0xFE))
         return;
 
     pthread_mutex_lock(&spi_mutex);
 
     if (idx == 0xFF) {
-        for (int i = 1; i < NUM_LEDS; i++)
+        for (int i = NET_LED_INDEX + 1; i < NUM_LEDS; i++)
             apply_config(i, r, g, b, effect, period_ms);
     } else if (idx == 0xFE) {
-        for (int i = 1; i < NUM_LEDS; i++)
+        for (int i = NET_LED_INDEX + 1; i < NUM_LEDS; i++)
             apply_config(i, 0, 0, 0, EFFECT_SOLID, 0);
     } else {
         apply_config((int)idx, r, g, b, effect, period_ms);
@@ -247,6 +391,13 @@ int main(void)
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT,  &sa, NULL);
 
+    /* Dirty-bit crash detection: flag file is created on start, removed on clean shutdown.
+     * If it already exists at startup the previous run didn't exit cleanly. */
+    int crashed = (access(RUNNING_FLAG, F_OK) == 0);
+    mkdir("/var/lib/led_daemon", 0755);   /* no-op if already exists */
+    int flagfd = open(RUNNING_FLAG, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (flagfd >= 0) close(flagfd);
+
     int ret = gpioInitialise();
     if (ret < 0) {
         fprintf(stderr, "gpioInitialise failed: %d\n", ret);
@@ -266,9 +417,10 @@ int main(void)
     flush_leds();
     pthread_mutex_unlock(&spi_mutex);
 
-    pthread_t sock_tid, fx_tid;
+    pthread_t sock_tid, fx_tid, net_tid;
     pthread_create(&sock_tid, NULL, socket_thread, NULL);
     pthread_create(&fx_tid,   NULL, effect_thread,  NULL);
+    pthread_create(&net_tid,  NULL, net_thread,     NULL);
 
     /* Blink red on LED 0 until SIGUSR1 */
     int red_on = 0;
@@ -278,20 +430,38 @@ int main(void)
         usleep(BLINK_INTERVAL_US);
     }
 
-    if (running)
-        set_system_led(40, 0, 0);   /* GRB: G=40, R=0, B=0 — solid green */
+    if (running) {
+        if (crashed) {
+            /* Fast red blink for CRASH_SHOW_SEC seconds to signal unclean previous shutdown */
+            int iters = (CRASH_SHOW_SEC * 1000) / (CRASH_BLINK_HALF_MS * 2);
+            for (int i = 0; i < iters && running; i++) {
+                set_system_led(0, 40, 0);
+                usleep(CRASH_BLINK_HALF_MS * 1000);
+                set_system_led(0, 0, 0);
+                usleep(CRASH_BLINK_HALF_MS * 1000);
+            }
+        }
+        if (running)
+            set_system_led(40, 0, 0);   /* GRB: G=40, R=0, B=0 — solid green */
+    }
 
     while (running)
         pause();
 
-    /* Cleanup: clear all LEDs */
+    pthread_join(sock_tid, NULL);
+    pthread_join(fx_tid,   NULL);
+    pthread_join(net_tid,  NULL);
+
+    unlink(RUNNING_FLAG);   /* clean shutdown — clear dirty bit */
+
+    /* Set LED 0 solid red: Jetson is off.
+     * WS2812B holds this colour while the strip has 5V from the drone battery. */
     pthread_mutex_lock(&spi_mutex);
     memset(led_state, 0, sizeof(led_state));
+    led_state[0][1] = 40;   /* GRB layout: index 1 is red */
     flush_leds();
     pthread_mutex_unlock(&spi_mutex);
 
-    pthread_join(sock_tid, NULL);
-    pthread_join(fx_tid,   NULL);
     spiClose(spi_handle);
     gpioTerminate();
     return 0;
